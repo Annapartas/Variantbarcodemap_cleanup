@@ -1,65 +1,21 @@
 #!/usr/bin/env python3
-"""
-BC_FC_variant_filter.py
+"""Filter barcode/flycode variant maps, writing strict two-column Enrich2 inputs.
 
-Input:
-    A plain text or gzipped file with two columns:
-        DNA_code    Variant_sequence
-
-    DNA_code can be either:
-        - barcode: 33-bp DNA barcode, not translated
-        - flycode: variable-length DNA flycode, translated to peptide
-
-The library type is specified in the JSON parameter file:
-    "library_type": "barcoded"
-or:
-    "library_type": "flycoded"
-
-Output:
-    1. *_filtered.txt.gz
-       Same two-column format as input:
-           DNA_code    Variant_sequence
-
-    2. *_peptide_variantcode.tsv
-       DNA_code, Peptide_code, Variant_code, Variant_sequence
-
-    3. *_peptide_variantcode_filteredOUT.tsv
-       DNA_code, Peptide_code, Variant_sequence, Reason
-
-Variant filtering:
-    - exact WT DNA sequence is accepted and marked as Variant_code = wt
-    - exactly one codon substitution is accepted only if:
-        * the amino-acid position is in allowed_mutation_positions
-        * the mutant codon is in allowed_substitution_codons
-        * the substitution does not create a stop codon
-    - no additional mutations are allowed
-    - the same DNA code may not be assigned to more than one accepted variant
-
-Barcode/flycode filtering:
-    - barcoded library:
-        barcode_regex = ^([ATGC]{3}[AT][GC]){6}[ATGC]{3}$
-        code must be 33 bp
-        code is not translated; Peptide_code remains empty
-
-    - flycoded library:
-        barcode_regex = ^GGTAGT(GCA|GTT|GAT|CCA|GAA|ACT|GGT|TCT|TAC|CTG|TGG|CAG|TTC|AAC){6,8}(TGGCGG|TGGCTGCGG|TGGCAGTCTCGG|TGGCAGGAAGGAGGTCGG)$
-        code is translated to peptide
-
-Requirements:
-    Python 3 only.
-
-Run:
-    python BC_FC_variant_filter.py --parameters params.json
+Usage: python BC_FC_variant_filter.py --parameters barcoded_variant_filter_params.json
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
+import os
+import sqlite3
+import tempfile
+from collections import Counter
 import gzip
 import json
 import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import TextIO
 
@@ -440,266 +396,226 @@ def classify_variant_gene(
     )
 
 
+def resolve_inputs(config: dict) -> list[Path]:
+    """Expand explicit input paths and globs, keeping each file only once."""
+    patterns = config.get("input_files", config.get("input_file"))
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not isinstance(patterns, list) or not patterns or any(
+        not isinstance(p, str) or not p.strip() for p in patterns
+    ):
+        fail("input_files must be a nonempty list of paths or wildcard patterns.")
+    paths = []
+    seen = set()
+    for pattern in patterns:
+        matches = sorted(glob.glob(os.path.expanduser(pattern)))
+        if not matches:
+            fail(f"No input files match: {pattern}")
+        for match in matches:
+            path = Path(match).resolve()
+            if not path.is_file():
+                fail(f"Input is not a regular file: {path}")
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+    return paths
+
+
+def output_stem(path: Path) -> str:
+    # Preserve the 'unique' part, so X_unique.txt.gz -> X_unique_filtered.txt.gz.
+    return default_output_prefix(path)
+
+
+def process_file(input_file: Path, output_dir: Path, settings: dict) -> dict:
+    """Filter one input using a temporary SQLite database, then publish outputs."""
+    stem = output_stem(input_file)
+    final_map = output_dir / f"{stem}_filtered.txt.gz"
+    final_accepted = output_dir / f"{stem}_protein_variantcode.tsv"
+    final_rejected = output_dir / f"{stem}_protein_variantcode_filteredOUT.tsv"
+    final_stats = output_dir / f"{stem}_filter_summary.json"
+    finals = [final_map, final_accepted, final_rejected, final_stats]
+    # Never accidentally overwrite existing results (including previous runs).
+    if any(path.exists() for path in finals):
+        fail(f"Output already exists for {input_file.name}. Move/delete old results before rerunning: "
+             + ", ".join(str(p) for p in finals if p.exists()))
+
+    with tempfile.TemporaryDirectory(prefix=f".{stem}_", dir=output_dir) as work:
+        work = Path(work)
+        db = sqlite3.connect(work / "records.sqlite")
+        try:
+            db.execute("CREATE TABLE rows (rowid INTEGER PRIMARY KEY, code TEXT, peptide TEXT, "
+                       "variant TEXT, sequence TEXT, reason TEXT, accepted INTEGER)")
+            db.execute("CREATE TABLE assignments (code TEXT, sequence TEXT, PRIMARY KEY(code, sequence))")
+            counts = Counter()
+            rejected_reasons = Counter()
+            with open_text(input_file, "r") as source:
+                if settings["has_header"]:
+                    next(source, None)
+                for line_no, line in enumerate(source, start=2 if settings["has_header"] else 1):
+                    if not line.strip():
+                        continue
+                    counts["total_rows"] += 1
+                    code, variant, peptide = "NA", line.strip(), ""
+                    try:
+                        code, variant = parse_input_line(line, line_no, settings["delimiter"])
+                        code = validate_dna_code(code, line_no, settings["library_settings"])
+                        variant = clean_dna(variant, f"variant sequence on line {line_no}")
+                        # Important: record *all* well-formed barcode/variant associations,
+                        # even those rejected for mutation reasons. One code associated with
+                        # multiple DNA sequences must not reach the Enrich2 input.
+                        db.execute("INSERT OR IGNORE INTO assignments VALUES (?,?)", (code, variant))
+                        if settings["library_settings"]["translate_code"]:
+                            peptide = translate_dna(code, f"flycode on line {line_no}")
+                        variant_label, reason = classify_variant_gene(
+                            variant_gene_dna=variant,
+                            wt_gene_dna=settings["wt_gene_dna"],
+                            wt_protein=settings["wt_protein"],
+                            allowed_positions=settings["allowed_positions"],
+                            allowed_codons=settings["allowed_codons"],
+                            position_offset=settings["position_offset"],
+                            allow_synonymous_as_wt=settings["allow_synonymous_as_wt"],
+                        )
+                    except ValueError as error:
+                        variant_label, reason = None, str(error)
+                        if "does not match barcode_regex" in reason or "expected 33 bp" in reason:
+                            counts["code_pattern_filtered_rows"] += 1
+                    accepted = int(variant_label is not None)
+                    counts["initially_accepted_rows" if accepted else "initially_filtered_rows"] += 1
+                    if not accepted:
+                        rejected_reasons[reason] += 1
+                    db.execute("INSERT INTO rows (code,peptide,variant,sequence,reason,accepted) "
+                               "VALUES (?,?,?,?,?,?)",
+                               (code, peptide, variant_label or "", variant, reason, accepted))
+                    if counts["total_rows"] % 10000 == 0:
+                        db.commit()
+            db.commit()
+            # Count distinct variant DNA sequences per valid code; no row is annotated in the
+            # Enrich2 map. Exclusions and reasons appear only in the rejection TSV.
+            db.execute("CREATE TABLE ambiguous AS SELECT code, COUNT(*) AS n FROM assignments "
+                       "GROUP BY code HAVING COUNT(*) > 1")
+            db.execute("CREATE UNIQUE INDEX ambiguous_code ON ambiguous(code)")
+            counts["ambiguous_dna_codes"] = db.execute("SELECT COUNT(*) FROM ambiguous").fetchone()[0]
+            tmp_map, tmp_accepted, tmp_rejected, tmp_stats = [work / f.name for f in finals]
+            with gzip.open(tmp_map, "wt", encoding="utf-8") as valid_map, \
+                 tmp_accepted.open("w", encoding="utf-8") as accepted_tsv, \
+                 tmp_rejected.open("w", encoding="utf-8") as rejected_tsv:
+                accepted_tsv.write("DNA_code\tPeptide_code\tVariant_code\tVariant_sequence\n")
+                rejected_tsv.write("DNA_code\tPeptide_code\tVariant_sequence\tReason\n")
+                for code, peptide, label, sequence, reason, was_accepted, ambiguity in db.execute(
+                    "SELECT r.code,r.peptide,r.variant,r.sequence,r.reason,r.accepted,a.n "
+                    "FROM rows r LEFT JOIN ambiguous a ON r.code=a.code ORDER BY r.rowid"
+                ):
+                    if ambiguity is not None:
+                        # Rejected initially invalid rows also get an ambiguity reason for transparency.
+                        counts["redundancy_filtered_rows"] += int(was_accepted)
+                        reason = f"dna_code_assigned_to_multiple_variant_sequences:{ambiguity}" + (
+                            f";original_reason:{reason}" if not was_accepted else "")
+                        rejected_reasons["ambiguous_dna_code"] += 1
+                    if was_accepted and ambiguity is None:
+                        valid_map.write(f"{code}\t{sequence}\n")
+                        accepted_tsv.write(f"{code}\t{peptide}\t{label}\t{sequence}\n")
+                        counts["final_accepted_rows"] += 1
+                    else:
+                        rejected_tsv.write(f"{code}\t{peptide}\t{sequence}\t{reason}\n")
+                        counts["final_rejected_rows"] += 1
+            counts["unique_accepted_codes"] = db.execute(
+                "SELECT COUNT(DISTINCT r.code) FROM rows r LEFT JOIN ambiguous a ON r.code=a.code "
+                "WHERE r.accepted=1 AND a.code IS NULL").fetchone()[0]
+            counts["unique_accepted_variants"] = db.execute(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT r.variant,r.sequence FROM rows r "
+                "LEFT JOIN ambiguous a ON r.code=a.code WHERE r.accepted=1 AND a.code IS NULL)"
+            ).fetchone()[0]
+            summary = {"input_file": str(input_file), "library_type": settings["library_settings"]["library_type"],
+                       **{key: counts[key] for key in (
+                           "total_rows", "initially_accepted_rows", "initially_filtered_rows",
+                           "code_pattern_filtered_rows", "ambiguous_dna_codes",
+                           "redundancy_filtered_rows", "final_accepted_rows", "final_rejected_rows",
+                           "unique_accepted_codes", "unique_accepted_variants")},
+                       "rejection_reasons": dict(rejected_reasons),
+                       "filtered_map": str(final_map), "accepted_tsv": str(final_accepted),
+                       "filtered_out_tsv": str(final_rejected)}
+            tmp_stats.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+            # Only completed files are placed in final location.
+            for temp_path, final_path in zip((tmp_map,tmp_accepted,tmp_rejected,tmp_stats), finals):
+                os.replace(temp_path, final_path)
+            return summary
+        finally:
+            db.close()
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Filter barcode/flycode-variant maps, optionally translate "
-            "flycodes, assign variant codes, and remove redundant DNA-code "
-            "assignments."
-        )
-    )
-
-    parser.add_argument(
-        "-p",
-        "--parameters",
-        required=True,
-        type=Path,
-        help="JSON parameter file",
-    )
-
+    parser = argparse.ArgumentParser(description="Filter multiple barcode/flycode variant maps.")
+    parser.add_argument("-p", "--parameters", required=True, type=Path, help="JSON parameter file")
     args = parser.parse_args()
     config = load_json(args.parameters)
-
-    input_file = Path(config.get("input_file", ""))
-    if not input_file.exists():
-        fail(f"Input file not found: {input_file}")
-
-    library_settings = get_library_settings(config)
-
-    wt_gene_dna = clean_dna(config.get("wt_gene_dna", ""), "wt_gene_dna")
-
-    if len(wt_gene_dna) % 3 != 0:
-        fail(f"wt_gene_dna length must be divisible by 3: {len(wt_gene_dna)} nt")
-
-    allow_terminal_stop_in_wt = bool(config.get("allow_terminal_stop_in_wt", False))
-    wt_protein = translate_dna(
-        wt_gene_dna,
-        "wt_gene_dna",
-        allow_terminal_stop=allow_terminal_stop_in_wt,
-    )
-
-    delimiter = config.get("delimiter", "auto")
-    has_header = bool(config.get("has_header", False))
-    allow_synonymous_as_wt = bool(config.get("allow_synonymous_as_wt", False))
-    position_offset = int(config.get("position_offset", 0))
-
-    allowed_positions = normalize_positions(
-        config.get("allowed_mutation_positions", [])
-    )
-    allowed_codons = normalize_codons(
-        config.get("allowed_substitution_codons", [])
-    )
-
-    prefix = config.get("output_prefix", default_output_prefix(input_file))
-
-    filtered_txt_gz = Path(
-        config.get("filtered_txt_gz", f"{prefix}_filtered.txt.gz")
-    )
-    accepted_tsv = Path(
-        config.get("peptide_variantcode_tsv", f"{prefix}_peptide_variantcode.tsv")
-    )
-    filtered_out_tsv = Path(
-        config.get(
-            "peptide_variantcode_filtered_out_tsv",
-            f"{prefix}_peptide_variantcode_filteredOUT.tsv",
-        )
-    )
-
-    for output_path in (filtered_txt_gz, accepted_tsv, filtered_out_tsv):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    total_rows = 0
-    initially_accepted = 0
-    initially_filtered = 0
-    code_pattern_filtered = 0
-    barcode_to_variant_keys: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    accepted_records: list[dict] = []
-    filtered_records: list[dict] = []
-
-    with open_text(input_file, "r") as source:
-        if has_header:
-            next(source, None)
-
-        for line_number, line in enumerate(source, start=2 if has_header else 1):
-            if not line.strip():
-                continue
-
-            total_rows += 1
-
-            try:
-                dna_code, variant_sequence = parse_input_line(
-                    line=line,
-                    line_number=line_number,
-                    delimiter=delimiter,
-                )
-
-                dna_code = validate_dna_code(
-                    dna_code=dna_code,
-                    line_number=line_number,
-                    library_settings=library_settings,
-                )
-
-                variant_sequence = clean_dna(
-                    variant_sequence,
-                    f"variant sequence on line {line_number}",
-                )
-
-                if library_settings["translate_code"]:
-                    peptide_code = translate_dna(
-                        dna_code,
-                        f"DNA {library_settings['code_name']} on line {line_number}",
-                        allow_terminal_stop=False,
-                    )
-                else:
-                    peptide_code = ""
-
-                variant_code, reason = classify_variant_gene(
-                    variant_gene_dna=variant_sequence,
-                    wt_gene_dna=wt_gene_dna,
-                    wt_protein=wt_protein,
-                    allowed_positions=allowed_positions,
-                    allowed_codons=allowed_codons,
-                    position_offset=position_offset,
-                    allow_synonymous_as_wt=allow_synonymous_as_wt,
-                )
-
-                if variant_code is None:
-                    initially_filtered += 1
-                    filtered_records.append(
-                        {
-                            "dna_code": dna_code,
-                            "peptide_code": peptide_code,
-                            "variant_sequence": variant_sequence,
-                            "reason": reason,
-                        }
-                    )
-                    continue
-
-                initially_accepted += 1
-
-                record = {
-                    "dna_code": dna_code,
-                    "peptide_code": peptide_code,
-                    "variant_sequence": variant_sequence,
-                    "variant_code": variant_code,
-                    "reason": reason,
-                }
-                accepted_records.append(record)
-                barcode_to_variant_keys[dna_code].add((variant_code, variant_sequence))
-
-            except ValueError as error:
-                initially_filtered += 1
-
-                reason = str(error)
-                if "does not match barcode_regex" in reason or "expected 33 bp" in reason:
-                    code_pattern_filtered += 1
-
-                try:
-                    dna_code, variant_sequence = parse_input_line(
-                        line=line,
-                        line_number=line_number,
-                        delimiter=delimiter,
-                    )
-                except ValueError:
-                    dna_code = "NA"
-                    variant_sequence = line.strip()
-
-                filtered_records.append(
-                    {
-                        "dna_code": dna_code,
-                        "peptide_code": "",
-                        "variant_sequence": variant_sequence,
-                        "reason": reason,
-                    }
-                )
-
-    final_accepted_records = []
-    redundancy_filtered_records = []
-
-    for record in accepted_records:
-        dna_code = record["dna_code"]
-        variant_keys = barcode_to_variant_keys[dna_code]
-
-        if len(variant_keys) > 1:
-            redundancy_filtered_records.append(
-                {
-                    "dna_code": record["dna_code"],
-                    "peptide_code": record["peptide_code"],
-                    "variant_sequence": record["variant_sequence"],
-                    "reason": (
-                        "dna_code_assigned_to_multiple_variants:"
-                        + str(len(variant_keys))
-                    ),
-                }
-            )
-        else:
-            final_accepted_records.append(record)
-
-    filtered_records.extend(redundancy_filtered_records)
-
-    with open_text(filtered_txt_gz, "w") as handle:
-        for record in final_accepted_records:
-            handle.write(
-                f"{record['dna_code']}\t{record['variant_sequence']}\n"
-            )
-
-    with accepted_tsv.open("w", encoding="utf-8") as handle:
-        handle.write(
-            "DNA_code\tPeptide_code\tVariant_code\tVariant_sequence\n"
-        )
-
-        for record in final_accepted_records:
-            handle.write(
-                f"{record['dna_code']}\t"
-                f"{record['peptide_code']}\t"
-                f"{record['variant_code']}\t"
-                f"{record['variant_sequence']}\n"
-            )
-
-    with filtered_out_tsv.open("w", encoding="utf-8") as handle:
-        handle.write(
-            "DNA_code\tPeptide_code\tVariant_sequence\tReason\n"
-        )
-
-        for record in filtered_records:
-            handle.write(
-                f"{record['dna_code']}\t"
-                f"{record['peptide_code']}\t"
-                f"{record['variant_sequence']}\t"
-                f"{record['reason']}\n"
-            )
-
-    unique_accepted_codes = len({r["dna_code"] for r in final_accepted_records})
-    unique_accepted_variants = len(
-        {(r["variant_code"], r["variant_sequence"]) for r in final_accepted_records}
-    )
-
-    print("Barcode/flycode variant filtering complete")
-    print(f"Input file:                         {input_file}")
-    print(f"Library type:                       {library_settings['library_type']}")
-    print(f"DNA code regex:                     {library_settings['barcode_regex']}")
-    print(f"Translate DNA code:                 {library_settings['translate_code']}")
-    print(f"Required DNA code length:           {library_settings['required_code_length']}")
-    print(f"WT gene length:                     {len(wt_gene_dna)} nt")
-    print(f"WT protein length:                  {len(wt_protein)} aa")
-    print(f"Total input rows:                   {total_rows}")
-    print(f"Initially accepted rows:            {initially_accepted}")
-    print(f"Initially filtered rows:            {initially_filtered}")
-    print(f"Code pattern/length filtered rows:  {code_pattern_filtered}")
-    print(f"Redundancy-filtered rows:           {len(redundancy_filtered_records)}")
-    print(f"Final accepted rows:                {len(final_accepted_records)}")
-    print(f"Unique accepted DNA codes:          {unique_accepted_codes}")
-    print(f"Unique accepted variants:           {unique_accepted_variants}")
-    print(f"Filtered txt.gz:                    {filtered_txt_gz}")
-    print(f"Peptide/variant-code TSV:           {accepted_tsv}")
-    print(f"Filtered-out TSV:                   {filtered_out_tsv}")
-
+    if "output_prefix" in config or any(k in config for k in (
+        "filtered_txt_gz", "protein_variantcode_tsv", "protein_variantcode_filtered_out_tsv"
+    )):
+        fail("Remove legacy output_prefix / per-file output names from the JSON; "
+             "output filenames are now derived from each input filename.")
+    inputs = resolve_inputs(config)
+    output_dir = Path(config.get("output_directory", "results")).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stems = [output_stem(p) for p in inputs]
+    if len(stems) != len(set(stems)):
+        fail("Two input files produce the same output basename; rename inputs to prevent collisions.")
+    # Fail before any processing if a previous run would be overwritten.
+    for stem in stems:
+        expected = [
+            output_dir / f"{stem}_filtered.txt.gz",
+            output_dir / f"{stem}_protein_variantcode.tsv",
+            output_dir / f"{stem}_protein_variantcode_filteredOUT.tsv",
+            output_dir / f"{stem}_filter_summary.json",
+        ]
+        if any(p.exists() for p in expected):
+            fail(f"Existing outputs for {stem}; move/delete them before rerunning.")
+    if (output_dir / "filter_summary.tsv").exists():
+        fail("Combined filter_summary.tsv already exists; move/delete it before rerunning.")
+    wt = clean_dna(config.get("wt_gene_dna", ""), "wt_gene_dna")
+    if len(wt) % 3:
+        fail("WT DNA length must be divisible by three.")
+    protein = translate_dna(wt, "wt_gene_dna", config.get("allow_terminal_stop_in_wt", False))
+    positions = normalize_positions(config.get("allowed_mutation_positions", []))
+    if max(positions) > len(protein):
+        fail(f"Allowed mutation position {max(positions)} exceeds WT protein length {len(protein)}.")
+    settings = {
+        "library_settings": get_library_settings(config),
+        "wt_gene_dna": wt, "wt_protein": protein,
+        "allowed_positions": positions,
+        "allowed_codons": normalize_codons(config.get("allowed_substitution_codons", [])),
+        "delimiter": config.get("delimiter", "auto"),
+        "has_header": bool(config.get("has_header", False)),
+        "allow_synonymous_as_wt": bool(config.get("allow_synonymous_as_wt", False)),
+        "position_offset": int(config.get("position_offset", 0)),
+    }
+    summaries = []
+    for index, path in enumerate(inputs, 1):
+        print(f"[{index}/{len(inputs)}] Filtering {path}", flush=True)
+        summary = process_file(path, output_dir, settings)
+        summaries.append(summary)
+        print(f"  Accepted: {summary['final_accepted_rows']}; rejected: "
+              f"{summary['final_rejected_rows']}; ambiguous codes: {summary['ambiguous_dna_codes']}", flush=True)
+    overall = output_dir / "filter_summary.tsv"
+    if overall.exists():
+        fail(f"Combined summary already exists: {overall}. Move/delete it before rerunning.")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output_dir,
+                                     prefix=".summary_", delete=False) as handle:
+        tmp_summary = Path(handle.name)
+        cols = ["input_file", "library_type", "total_rows", "initially_accepted_rows",
+                "initially_filtered_rows", "code_pattern_filtered_rows", "ambiguous_dna_codes",
+                "redundancy_filtered_rows", "final_accepted_rows", "final_rejected_rows",
+                "unique_accepted_codes", "unique_accepted_variants"]
+        handle.write("\t".join(cols) + "\n")
+        for summary in summaries:
+            handle.write("\t".join(str(summary[c]) for c in cols) + "\n")
+    os.replace(tmp_summary, overall)
+    print(f"Completed {len(summaries)} files. Summary: {overall}")
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)
