@@ -1,56 +1,66 @@
 # BC/FC variant filter
 
-Filter DNA barcode–variant or flycode–variant maps and assign protein mutation labels.
+Filter barcode–variant or flycode–variant maps and prepare **two-column Enrich2 input** files. Works with plain-text or gzipped input and can process multiple files in one run. Uses Python 3 standard library only.
 
 ## What it does
 
-- Validates DNA barcodes (33 bp) or translates flycodes into peptide codes.
-- Accepts an exact wild-type gene (`wt`) or a **single permitted codon substitution** at an allowed position.
-- Rejects invalid codes, multiple substitutions, disallowed mutations, and ambiguous DNA-code-to-variant assignments.
-- Writes a filtered two-column map, an accepted-variant table, and a rejection table with reasons.
+- Checks barcode or flycode sequence design (and translates flycodes).
+- Accepts exact wild-type DNA or **one** allowed codon substitution at an allowed amino-acid position. Every other nucleotide must match the WT reference. Synonymous changes are rejected by default.
+- Excludes ambiguous DNA codes linked to **multiple distinct variant DNA sequences**, including initially rejected variants. The reason is recorded **only in the filtered-out report**, never in the Enrich2 map.
+- Processes each input separately and generates per-file and combined QC statistics.
 
-## Requirements
+## Input and configuration
 
-Python **3.10+** (standard library only; no additional Python packages).
+The input is a two-column file **without a header** (unless `has_header` is set):
 
-## Configure
+```text
+DNA_code    Variant_sequence
+```
 
-Choose and edit one of the included files:
+Edit one of the supplied configurations:
+- `barcoded_variant_filter_params.json`
+- `flycoded_variant_filter_params.json`
 
-- `barcoded_variant_filter_params.json` — DNA barcode library.
-- `flycoded_variant_filter_params.json` — DNA flycode library.
+Specify files or wildcard patterns (absolute paths work on clusters):
 
-Set `input_file` to your two-column `.txt`, `.tsv`, or `.txt.gz` input (no header unless `has_header` is `true`), and adjust the `wt_gene_dna`, permitted mutation positions and codons, and output paths as needed. **Variant sequences must include the full gene, in the same reading frame and length as `wt_gene_dna`.**
+```json
+"input_files": ["/path/to/data/*_unique.txt.gz"],
+"output_directory": "/path/to/results"
+```
 
-Absolute input/output paths work on clusters. Relative paths are interpreted from the directory in which you run the pipeline; the supplied shell script changes into the repository directory.
+Set `wt_gene_dna`, `allowed_mutation_positions`, and `allowed_substitution_codons` for your experiment. Mutation positions are **1-based** and relative to the full WT gene supplied. The supplied configurations are examples based on MsbA.
 
 ## Run
 
-**Python (local or interactive cluster session)**
-
 ```bash
 python3 BC_FC_variant_filter.py --parameters barcoded_variant_filter_params.json
-# or
-python3 BC_FC_variant_filter.py --parameters flycoded_variant_filter_params.json
 ```
 
-**SLURM cluster** — from the repository directory:
+For SLURM, submit **from the repository directory**:
 
 ```bash
-sbatch run_BC_FC_variant_filter.sh  # barcoded configuration
+sbatch run_BC_FC_variant_filter.sh
+# or flycoded input:
 sbatch --export=ALL,PARAMS=flycoded_variant_filter_params.json run_BC_FC_variant_filter.sh
 ```
 
-The job log is `BC_FC_filter_JOBID.log` in the directory where you submitted the job. To request notification emails (if supported by your cluster), append `--mail-user=you@university.edu` to `sbatch`. Set `CONDA_BASE` and optionally `BC_FILTER_ENV` if your cluster requires Conda activation; otherwise a working `python3` is sufficient. Adjust SLURM memory and time settings in the script to suit your data.
+Check `BC_FC_filter_JOBID.log` and `sacct -j JOBID`. Email events (`BEGIN,END,FAIL`) can be enabled with `sbatch --mail-user=you@example.org ...`, if your cluster supports mail. The shell script optionally activates Conda when `CONDA_BASE` is set, but Conda is not required for the pipeline itself.
 
 ## Outputs
 
+For each `sample_unique.txt.gz`:
+
 | File | Contents |
 | --- | --- |
-| `*_filtered.txt.gz` | Accepted `DNA_code` and `Variant_sequence` |
-| `*_peptide_variantcode.tsv` (or configured filename) | Accepted codes, peptides (flycodes only), variant labels, sequences |
-| `*_peptide_variantcode_filteredOUT.tsv` (or configured filename) | Rejected entries and reasons |
+| `sample_unique_filtered.txt.gz` | **Enrich2 input:** exactly two tab-separated DNA columns, no header, no extra annotations |
+| `sample_unique_protein_variantcode.tsv` | Accepted barcode/flycode, peptide (for flycodes), variant name, variant DNA |
+| `sample_unique_protein_variantcode_filteredOUT.tsv` | Rejected records and explicit rejection reasons, including ambiguous codes |
+| `sample_unique_filter_summary.json` | Per-file counts and rejection reasons |
 
-The actual filenames come from the selected JSON file. The completion summary and counts are printed to the terminal or SLURM log.
+`filter_summary.tsv` aggregates results for all inputs. Outputs are never silently overwritten: move/delete existing results to rerun. Inputs with identical basenames from different directories must be renamed to avoid output collisions.
 
-**Numbering:** `allowed_mutation_positions` uses 1-based positions in the **supplied WT gene**; `position_offset` changes only the displayed mutation label. If your upstream pipeline omitted the first six coding nucleotides, correct that upstream and use matching full-length reference and variant sequences here.
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
